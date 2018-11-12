@@ -1,7 +1,11 @@
 ---
-title: "Lab9: R Notebook"
-output: html_notebook
+title: "Comparison of Shrinkage Estimators"
+output: html_document
 ---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
 
 ## Introduction to JAGS
 
@@ -17,49 +21,97 @@ output: html_notebook
     + starting values (optional)
     + parameters to save
     + options for running the MCMC
-  
+
+## Prelimiaries 
+
+Load Libraries and Data
+
+```{r}
+library(MASS)
+library(lars)
+### R interface to JAGS:
+library(R2jags)
+library(R2WinBUGS)
+
+data(College, package="ISLR")
+summary(College)
+n = nrow(College)
+set.seed(42)
+
+n.train = floor(.80*n)
+n.test = n - n.train
+```
+
+
+Define RMSE
+
+```{r}
+rmse = function(truth, est) { sqrt(mean((truth - est)^2))}
+```
+
 ##  Model specification
 
 JAGS lets you write out the distributions using a syntax that is similar to R's functions.   This can be written in R and then passed onto JAGS.
 
-Let's define a function for the Bayesian Ridge Regression Model
-
-```{r}
-rr.model = function() {
-
-  for (i in 1:n) {
-      mu[i] <- inprod(X[i,], beta.s)  + alpha0
-      # alpha are parameters in scaled model
-      Y[i] ~ dnorm(mu[i], phi)
-  }
-  phi ~ dgamma(1.0E-6, 1.0E-6)  # approximate p(phi) = 1/phi
-  alpha0  ~ dnorm(0, 1.0E-10)  # approximate p(alpha_0) = 1
-  
-  for (j in 1:p) {
-      prec.beta[j] <- lambda.beta*phi
-      beta.s[j] ~ dnorm(0, prec.beta[j])
-  }
-# Induce Cauchy Prior on beta
-  lambda.beta ~ dgamma(.5, .5)
-#   lambda.beta = 3.06
-  for (j in 1:p) {
-      beta[j] <- beta.s[j]/scales[j]   # rescale
-  }
-  # transform intercept to original units (uncentered)
-  beta0 <- alpha0 - inprod(beta, Xbar)
-
-  sigma <- pow(phi, -.5)
-}
-```
+Let's define a function for the Bayesian Generalized Double Pareto Model of  [Armagan et al](https://arxiv.org/abs/1104.0861) 
 
 
 This function assumes that the design matrix has been scaled and centered ahead of time.  This is computationally more efficient as a one time calculation rather than doing it within the JAGS code.
 
-- Stochastic nodes
+- Stochastic nodes use  `~` for distributed as
 
-- deterministic nodes
+- deterministic nodes  use `<-` rather than `=`  (not really `R`) for assignment
 
-- assignment needs to use `<-` rahter than `=`  (not really `R`)
+- second argument in dnorm is precision **not variance**
+
+
+### Define Generalized Double Pareto Model
+
+```{r}
+gdp.model = function() {
+
+  for (i in 1:n.train) {
+      mu[i] <- inprod(X.train[i,], beta) + alpha
+      Y.train[i] ~ dnorm(mu[i], phi)
+  }
+  for (i in 1:n.test) {
+    mupred[i] <- inprod(X.test[i,], beta[1:p]) + alpha
+#    Y.test[i] ~ dnorm(mupred[i], phi)  # drop or make sure that Y.test is NA
+  }
+  phi ~ dgamma(1.0E-6, 1.0E-6)
+  alpha ~ dnorm(0, 1.0E-10)
+
+  # GDP Prior on beta
+  #   beta_j | tau^2, phi N(0, tau^2_j/phi)
+  #   tau^2_j ~ Exp(lambda.beta/2)
+  #   lambda_j ~ Gamma(1,1)  
+  for (j in 1:p) {
+      prec.beta[j] <- sqrt(n.train - 1)*phi/tau[j]
+      tau[j] ~ dexp(lambda^2/2)
+      beta[j] ~ dnorm(0, prec.beta[j])
+  }
+  
+  
+
+  lambda ~ dgamma(1, 1)  # alpha = eta = 1 from paper
+
+  for (j in 1:p) {
+      beta.orig[j] <- beta[j]/scales[j]   # rescale for original units
+  }
+  beta.0[1] <- alpha[1] - inprod(beta.orig[1:p], Xbar)
+
+  sigma <- pow(phi, -.5)
+}
+
+```
+
+
+We can save any of the stochastic or deterministic nodes
+
+```{r}
+parameters = c("mupred","beta.0", "beta.orig","sigma","lambda.beta")
+```
+
 
 ## Data
 
@@ -69,119 +121,100 @@ All quantities that are in the function need to be either generated (stochastic)
 For say the college data:
 
 ```{r}
-library(ISLR)
-data(College)
-# JAGS needs a matrix not a dataframe
-X = model.matrix(sqrt(Apps) ~ ., data=College)
-X = X[,-1]  # drop intercept
+X = as.matrix(College[, -(1:2)]) # remove Private factor and Apps = Y
+X = cbind(as.numeric(College$Private),X)
+colnames(X)[1] = "Private"
+# Create a data list with inputs for JagsBugs
+```
 
-# Create a data list with inputs for JAGS
-scales = apply(X, 2, FUN=function(x) {
-  sd(x)*sqrt(length(x) - 1)})
-Xbar = apply(X, 2, mean)
-scaled.X = scale(X, center=Xbar, scale = scales)
-data = list(Y = log(College$Apps),   
-            X=scaled.X, p=ncol(X))
-data$n = length(data$Y)
-data$scales = scales
-data$Xbar = Xbar
+## Simulation to compare GDP and Lasso with OLS
 
+```{r}
+set.seed(42)
+nsim=1
+rmse.ols=rep(NA,nsim);
+rmse.GDP=rep(NA,nsim); 
+rmse.lasso=rep(NA,nsim)
+
+for ( i in 1:nsim) {
+  train = sample(1:n, n.train)
+  X.train = X[train,]
+  X.test= X[-train,]
+  Y.train = sqrt(College$Apps[train])  #modify transformation
+  Y.test = sqrt(College$Apps[-train])
+  
+  # GDP with JAGS
+  scaled.X.train = scale(X.train)
+  data = list(Y.train = Y.train, X.train=scaled.X.train, p=ncol(X))
+  data$n.train = length(data$Y.train) 
+  data$n.test = n.test
+  data$scales = attr(scaled.X.train, "scaled:scale")
+  data$Xbar = attr(scaled.X.train, "scaled:center")
+  data$X.test = scale(X.test, center=data$Xbar, scale=data$scales)
+  #data$Y.test = rep(NA, n.test)
+
+  college.sim = jags(data, inits=NULL, parameters,
+                model.file=gdp.model,  n.iter=10000)
+
+  rmse.GDP[i] = rmse(college.sim$BUGSoutput$mean$mupred, Y.test)
+
+  # lasso 
+  db.lars = lars(X.train,Y.train, type="lasso")
+  Cp = summary(db.lars)$Cp
+  best = (1:length(Cp))[Cp == min(Cp)]     # step with smallest Cp
+  y.pred = predict(db.lars, s=best, newx=X.test)
+  rmse.lasso[i] =  rmse(Y.test,y.pred$fit)
+
+  #ols
+  y.pred = predict(lm(sqrt(Apps) ~ ., data=College,
+                      subset=train), newdata=College[-train,]) # old predictions    
+  rmse.ols[i] = rmse(Y.test, y.pred)
+
+ print(c(i, rmse.ols[i], rmse.lasso[i], rmse.GDP[i]))
+
+}
 ```
 
 
-## Parameters
-
-we can save any of the stochastic or deterministic nodes
+Compare boxplots of RMSE
 
 ```{r}
-parameters = c("alpha0","beta.s", "beta", "beta0", "lambda.beta", "sigma")
-```
-
-## Running JAGS
-
-We will run JAGS through R using functions in the R2jags package.
-
-```{r}
-library(R2jags)
-rr.sim = jags(data, inits=NULL, 
-              parameters.to.save=parameters,
-              model.file=rr.model,  
-              n.iter=10000)
-
-theta = as.mcmc(rr.sim$BUGSoutput$sims.matrix)  # create an MCMC object 
-
-```
-
-You should see a progress bar as this runs
-
-## Output
-
-Let's look at the output:  the summary function just tells us the names of objects and their size/type
-
-```{r}
-summary(rr.sim) 
+boxplot(rmse.ols, rmse.lasso, rmse.GDP)
 ```
 
 
-Plots and basic diagnostics
-
+## look at output of last sim
 ```{r}
-plot(rr.sim)
-```
+college.bayes.coef = as.mcmc(college.sim$BUGSoutput$sims.matrix)  # create an MCMC object of coefficients
+plot(college.sim)
+summary(college.sim)  # names of objects in college.sim
+college.sim  # print gives summary
+par(mfrow=c(1,1))
+quantile(college.bayes.coef[,"beta.orig[1]"], c(.025, .5, .975))
+HPDinterval(as.mcmc(college.bayes.coef[,"beta.orig[1]"]))
+HPDinterval(as.mcmc(college.bayes.coef[,"beta.orig[2]"]))
+HPDinterval(as.mcmc(college.bayes.coef[,"beta.orig[3]"]))
+HPDinterval(as.mcmc(college.bayes.coef[,"beta.orig[4]"]))
 
 
-```{r}
-print(rr.sim)
-```
 
-
-Compare to Ridge Regression:
-
-```{r}
-library(MASS)
-college.ridge = lm.ridge(log(Apps) ~ ., data=College, lambda=seq(0, 10, length=50))
-select(college.ridge)
-best = which.min(college.ridge$GCV)
-best.rr = lm.ridge(sqrt(Apps) ~ ., data=College, 
-                   lambda=college.ridge$lambda[best])
-
-bayes.rr = rr.sim$BUGSoutput$summary
-beta.s = bayes.rr[grep("beta.s", rownames(bayes.rr)), "mean" ]
-beta = bayes.rr[grep("beta\\[", rownames(bayes.rr)), "mean" ]
-
-
-plot(coef(best.rr)[-1], beta, xlab="Ridge Regression", ylab="Bayes Posterior Mean (scaled)")
-abline(0,1)
-```
-
-
-Check ??
-
-## HPD Intervals and Posterior Density for Lambda
-
-```{r}
-hist(theta[,"lambda.beta"], prob=T, xlab=expression(lambda[beta]),
+hist(college.bayes.coef[,"beta.orig[1]"], prob=T, xlab=expression(beta[1]),
      main="Posterior Distribution")
-lines(density(theta[,"lambda.beta"]))
-densplot(theta[,"lambda.beta"], xlab =expression(lambda[beta]) )
+lines(density(college.bayes.coef[,"beta.orig[1]"]))
+densplot(college.bayes.coef[,"beta.orig[1]"])
+par(mfrow=c(1,2))
+hist(college.bayes.coef[,"beta.orig[2]"], prob=T, xlab=expression(beta[1]),
+     main="Posterior Distribution")
+lines(density(college.bayes.coef[,"beta.orig[2]"]))
+densplot(college.bayes.coef[,"beta.orig[2]"])
+hist(college.bayes.coef[,"beta.orig[3]"], prob=T, xlab=expression(beta[1]),
+     main="Posterior Distribution")
+lines(density(college.bayes.coef[,"beta.orig[3]"]))
+densplot(college.bayes.coef[,"beta.orig[3]"])
+hist(college.bayes.coef[,"beta.orig[4]"], prob=T, xlab=expression(beta[1]),
+     main="Posterior Distribution")
+lines(density(college.bayes.coef[,"beta.orig[4]"]))
+densplot(college.bayes.coef[,"beta.orig[4]"])
+
 ```
 
-
-```{r}
-HPDinterval(as.mcmc(theta[,"lambda.beta"]))
-```
-
-
-How does the GCV estimate of  $\lambda$ compare to the posterior mean? or where does it fall in the distribution?
-
-## To do  or think about
-
-
-1.  How would you implement a predictive check for  ridge regression 
-    (frequentist or Bayesian)?
-
-2.  Explore out of sample errors or coverage?  How does this compare to your earlier results?
-
-3.  What about other model diagnostics?
-
-4.  Look around at R packages that implement Ridge regression.  How many provide uncertainty estimates associated with the $\beta$s or predictions?
